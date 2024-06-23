@@ -219,7 +219,6 @@ class ChatDataset(torch.utils.data.Dataset):
                     image_file = image_dir / item['image']['path']
                 else:
                     raise ValueError(f"Unknown image format {item['image']}")
-                image_file = [image_file]
             elif "images" in item and item['images'] and len(item['images']) > 0:
                 if isinstance(item['images'][0], str):
                     image_file = [image_dir / image for image in item['images']]
@@ -252,13 +251,19 @@ class ChatDataset(torch.utils.data.Dataset):
         conv_messages = self.conversations[idx]
         sub_images = self.all_images[idx]
         sub_images = load_images(sub_images)
+        
         # resize sub_images to be at least 16 * 16 if image is too small, to avoid errors in clip image processor
         if sub_images:
             for i, image in enumerate(sub_images):
                 if image.size[0] < 16 or image.size[1] < 16:
                     scale_factor = max(16 / image.size[0], 16 / image.size[1])
                     sub_images[i] = image.resize((int(image.size[0] * scale_factor), int(image.size[1] * scale_factor))).convert("RGB")
-                    
+                elif image.size[0] > 980 or image.size[1] > 980:
+                    scale_factor = max(image.size[0] / 980, image.size[1] / 980)
+                    # print(f"image size larger than 980 ({image.size}) - resize by {scale_factor}")
+                    sub_images[i] = image.resize((int(image.size[0] / scale_factor), int(image.size[1] / scale_factor))).convert("RGB")
+                    # print(f"new dim: {sub_images[i].size}")
+
         if self.conv.sep_style == SeparatorStyle.PLAIN:
             # NOTE: this is for the pretraining, where we only use the pure text or interleaved text and images
             source = conv_messages
@@ -341,18 +346,38 @@ class ChatDataset(torch.utils.data.Dataset):
         # replace IGNORE_INDEX in target_ids with 0 and decode it, then print for debug
         if torch.all(target == IGNORE_INDEX):
             print("no labels for a sample in ", self.data_path, self.name, self.split)
+            _target = target.clone().detach()
+            print("=== TARGET ===")
+            print(self.processor.tokenizer.decode(_target, skip_special_tokens=False))
+            print("=== INPUT_IDS ===")
+            print(self.processor.tokenizer.decode(input_ids, skip_special_tokens=False))
+
+            print(f"=== LENGTH === {len(input_ids)}")
+            print("=== IMG SIZES ===")
+            print([img.size for img in sub_images])
         
         # print(self.data_path, self.name, self.split)
         
         # for debug, print the targets to make sure the right tokens are learned
         # need to print to make sure that the masked tokens are correct.
-        # _target = target.clone().detach()
-        # _target[_target == IGNORE_INDEX] = 0
+        _target = target.clone().detach()
+        _target[_target == IGNORE_INDEX] = 0
+        decoded_targets = self.processor.tokenizer.decode(_target, skip_special_tokens=False)
+        # if "<end_of_utterance>" not in decoded_targets:
+        # print("<end_of_utterance> not found in targets")
+        # print(decode_targets)
+        # print("=== INPUT_IDS ===")
         # print(self.processor.tokenizer.decode(input_ids, skip_special_tokens=False))
-        # print(self.processor.tokenizer.decode(_target, skip_special_tokens=False))
-        
 
         return encoding
+
+    @staticmethod
+    def get_collator_fn(processor, max_length=None):
+        def collator_fn(batch):
+            batch_encoding = processor._right_pad_inputs_with_attention_mask(model_inputs=batch)
+            return batch_encoding
+
+        return collator_fn
 
 def read_video_pyav(container, indices):
     '''
@@ -551,162 +576,34 @@ class ChatVideoDataset(torch.utils.data.Dataset):
 
         return encoding
 
-class ClassificationDataset(torch.utils.data.Dataset):
-    """
-    conv format:
-    <s> {system}\n USER: {}<0x04>ASSISTANT: {}</s> ...
-    """
-    def __init__(
-        self, processor, data_path, dataset_type, name, split, max_seq_len,
-        is_master_worker=True, 
-        max_size=None, 
-        shuffle=False, 
-        max_num_images=None, 
-        vl_only=False,
-        offline_sha=None,
-        revision="script"
-    ):
+    @staticmethod
+    def get_collator_fn(processor, max_length=None):
+        def collator_fn(batch):
+            batch_encoding = processor._right_pad_inputs_with_attention_mask(model_inputs=batch)
+            return batch_encoding
+
+        return collator_fn
+
+class VQADataset(torch.utils.data.Dataset):
+    def __init__(self, processor, data_path, name, split, max_seq_len=1024):
         self.processor = processor
         self.data_path = Path(data_path)
-        self.dataset_type = dataset_type
         self.name = name
         self.split = split
-        self.is_master_worker = is_master_worker
-        self.max_size = max_size
-        self.max_num_images = max_num_images
-        self.max_seq_len = max_seq_len
-        print("Sleeping for", int(os.environ.get("LOCAL_RANK", 0)) * 5, "seconds")
-        time.sleep(int(os.environ.get("LOCAL_RANK", 0)) * 5) # avoid error when multiple processes try to access the same file
-        if self.data_path.exists() and self.dataset_type != "huggingface":
-            self.print(f"Loading dataset '{name}' from {data_path}")
-            self.data = load_json_data(data_path)
-            self.image_dir = self.data_path.parent
-            if shuffle:
-                random.seed(42)
-                random.shuffle(self.data)
-            if self.max_size:
-                print(f"Truncating dataset to from {len(self.data)} to {self.max_size}")
-                self.data = self.data[:self.max_size]
-        else:
-            # load from huggingface datasets
-            if HF_DATASETS_OFFLINE:
-                # when export HF_DATASETS_OFFLINE=1
-                print(f"Loading dataset '{name}' {split} from offline cached huggingface datasets")
-                self.data = read_local_cached_dataset(data_path, name, split, offline_sha)
-            else:
-                self.print(f"Loading dataset '{data_path}' {name} {split} from online huggingface datasets")
-                self.data = datasets.load_dataset(data_path, name, split=split, trust_remote_code=True, revision=revision)
-            _max_num_images = max([len(x) for x in self.data['images'] if x])
-            print(f"Max number of images per sample: {_max_num_images}, limit: {max_num_images}")
-            if max_num_images and _max_num_images > max_num_images:
-                print(f"Filtering dataset to images <= {max_num_images}")
-                self.filtered_data = self.data.filter(lambda x: len(x['images']) <= max_num_images if ('images' in x and x['images']) else True) # max 5 images
-                print(f"Filtered dataset size changed from {len(self.data)} to {len(self.filtered_data)}")
-                self.data = self.filtered_data
-            if vl_only:
-                print("Filtering dataset with images only")
-                self.data = self.data.filter(lambda x: "images" in x and x['images']) # debug
-                print("filter out images, now {}".format(len(self.data)))
-            self.image_dir = Path("/")
-            if shuffle:
-                self.data = self.data.shuffle(seed=42)
-            if self.max_size:
-                print(f"Truncating dataset to from {len(self.data)} to {self.max_size}")
-                self.data = self.data.select(range(self.max_size))
-
-        # for debugging    
-        # new_data = []
-        # for i, x in enumerate(self.data):
-        #     new_data.append(x)
-        #     if i > 100:
-        #         break
-        # self.data = new_data
-        
-        self.prompts, self.all_images, self.labels = self.preprocess()
-        
-    def print(self, *args, **kwargs):
-        if self.is_master_worker:
-            print(*args, **kwargs)
-
+        # self.data = load_json_data(data_file)
+    
     def preprocess(self):
-        
-        # process formats
-        image_dir = self.image_dir
-        prompts = []
-        all_images = []
-        label_names = list(self.data[0]['labels'].keys())
-        all_labels = []
-        for i, item in tqdm(
-            enumerate(self.data), desc="Format prompts and load images", 
-            total=len(self.data), disable=not self.is_master_worker
-        ):
-            # phd
-            
-            if "image" in item and item['image']:
-                if isinstance(item['image'], str):
-                    image_file = image_dir / item['image']
-                elif isinstance(item['image'], PIL.Image.Image):
-                    image_file = item['image']
-                elif isinstance(item['image'], dict):
-                    image_file = image_dir / item['image']['path']
-                else:
-                    raise ValueError(f"Unknown image format {item['image']}")
-            elif "images" in item and item['images'] and len(item['images']) > 0:
-                if isinstance(item['images'][0], str):
-                    image_file = [image_dir / image for image in item['images']]
-                elif isinstance(item['images'][0], dict):
-                    image_file = [image_dir / image['path'] for image in item['images']]
-                elif isinstance(item['images'][0], PIL.Image.Image):
-                    image_file = item['images']
-            else:
-                image_file = None
-            try:
-                if image_file:
-                    if isinstance(image_file, list) and all([isinstance(image, Path) for image in image_file]):
-                        assert all([image.exists() for image in image_file]), f"{image_file} does not exist"
-                    elif isinstance(image_file, Path):
-                        assert image_file.exists(), f"{image_file} does not exist"
-                else:
-                    image_file = None
-                prompts.append(item['prompt'])
-                all_images.append(image_file)
-                labels = [float(item['labels'][label_name]) for label_name in label_names]
-                all_labels.append(labels)
-                
-            except Exception as e:
-                print(f"Error at {i}")
-                print(e)
-        
-        return prompts, all_images, all_labels
+        pass
         
     def __len__(self):
-        return len(self.prompts)
-    
+        pass
     def __getitem__(self, idx):
-        prompt = self.prompts[idx]
-        sub_images = self.all_images[idx]
-        sub_images = load_images(sub_images)
-        labels = self.labels[idx]
-        # resize sub_images to be at least 16 * 16 if image is too small, to avoid errors in clip image processor
-        if sub_images:
-            for i, image in enumerate(sub_images):
-                if image.size[0] < 16 or image.size[1] < 16:
-                    scale_factor = max(16 / image.size[0], 16 / image.size[1])
-                    sub_images[i] = image.resize((int(image.size[0] * scale_factor), int(image.size[1] * scale_factor))).convert("RGB")
-        
-        image_token_count = prompt.count(DEFAULT_IMAGE_TOKEN)
-        if image_token_count < len(sub_images):
-            prompt += f"{DEFAULT_IMAGE_TOKEN} " * (len(sub_images) - image_token_count)
-        encoding = self.processor(prompt, sub_images, return_tensors="pt", truncation=True, max_length=self.max_seq_len)
-
-        if "image_patches" in encoding:
-            encoding.pop("attention_mask")
-            encoding['image_patches'] = encoding['image_patches'][0] # todo
-
-        encoding["labels"] = torch.tensor(labels, dtype=torch.float32).unsqueeze(0)
-
-        return encoding
+        pass
     
+    @staticmethod
+    def get_collator_fn(processor):
+        pass
+
 class DatasetCollection(torch.utils.data.Dataset):
     def __init__(self, datasets: List[torch.utils.data.Dataset], balancing=False):
         self.datasets = datasets
@@ -798,9 +695,8 @@ def load_data_from_config(data_args, processor):
         elif sub_dataset_config['format'] == 'chat_video':
             sub_dataset = ChatVideoDataset(processor, data_path, dataset_type, name, video_dir, split, max_seq_len, data_args.conv_format,
                 data_args.is_master_worker, max_size, shuffle, max_num_frames)
-        elif sub_dataset_config['format'] == 'classification':
-            sub_dataset = ClassificationDataset(processor, data_path, dataset_type, name, split, max_seq_len,
-                data_args.is_master_worker, max_size, shuffle, max_num_images, vl_only, offline_sha=offline_sha, revision=revision)
+        elif sub_dataset_config['format'] == 'vqa':
+            sub_dataset = VQADataset(processor, data_path, name, split, max_seq_len)
         else:
             raise ValueError(f"Unknown data format {sub_dataset_config['format']}")
         if split not in all_datasets:
@@ -812,3 +708,28 @@ def load_data_from_config(data_args, processor):
     val_dataset = DatasetCollection(all_datasets['val'], data_args.dataset_balancing) if 'val' in all_datasets else None
     test_dataset = DatasetCollection(all_datasets['test'], data_args.dataset_balancing) if 'test' in all_datasets else None
     return train_dataset, val_dataset, test_dataset, collator_fn
+
+def load_data(data_args, processor):
+    """
+    Args:
+        data_args: DataArguments
+        processor: FuyuProcessor
+    Returns:
+        train_dataset: Dataset
+        val_dataset: Dataset
+        test_dataset: Dataset
+        collator_fn: Callable
+    """
+    print("Loading data...")
+
+    data_kwargs = {}
+    data_kwargs["max_seq_len"] = data_args.max_seq_len
+    print("Max Context Length:", data_args.max_seq_len)
+    if data_args.data_format == "chat":
+        train_dataset = ChatDataset(processor, data_args.train_data_file, **data_kwargs) if data_args.train_data_file else None
+        val_dataset = ChatDataset(processor, data_args.val_data_file, **data_kwargs) if data_args.val_data_file else None
+        test_dataset = ChatDataset(processor, data_args.test_data_file, **data_kwargs) if data_args.test_data_file else None
+        # collator_fn = ChatDataset.get_collator_fn(processor)
+        print("Successfully loaded llava-instruct data.")
+    elif data_args.data_format == "vqa":
+        train_dataset = VQADataset(processor, data_args.train_data_file, **data_kwargs) if data_args.train_data_file else None

@@ -15,7 +15,7 @@ from mantis.train.data import (
     load_data_from_config, 
     set_ignore_index, set_default_image_token, 
     set_default_image_token_id,
-    ClassificationDataset,
+    # ClassificationDataset,
 )
 from pathlib import Path
 from typing import Optional
